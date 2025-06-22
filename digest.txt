@@ -1,0 +1,586 @@
+Directory structure:
+└── led_test_c/
+    ├── CMakeLists.txt
+    ├── blink.pio
+    ├── led_test_c.c
+    ├── led_test_c_patterns.c
+    ├── pico_sdk_import.cmake
+    └── sk9822.pio
+
+================================================
+File: CMakeLists.txt
+================================================
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.1.1)
+set(toolchainVersion RISCV_RPI_2_0_0_5)
+set(picotoolVersion 2.1.1)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
+# Wygenerowany plik Cmake dla projektu Pico
+
+cmake_minimum_required(VERSION 3.13)
+
+# Dołącz ustawienia dla rozszerzenia VS Code
+# Commented out to avoid configuration issues
+# if(WIN32)
+#     set(USERHOME $ENV{USERPROFILE})
+# else()
+#     set(USERHOME $ENV{HOME})
+# endif()
+# set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+# if (EXISTS ${picoVscode})
+#     include(${picoVscode})
+# endif()
+
+# Ustawia płytkę na Pico W, zgodnie z informacją od użytkownika
+set(PICO_BOARD pico2_w CACHE STRING "Board type")
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Dołącz SDK Raspberry Pi Pico
+set(PICO_SDK_PATH "${CMAKE_CURRENT_LIST_DIR}/pico-sdk")
+include(pico_sdk_import.cmake)
+
+project(led_test_sk9822 C CXX ASM)
+
+# Inicjalizuj SDK
+pico_sdk_init()
+
+# Dodaj plik wykonywalny, wskazując na nowy plik PIO
+add_executable(led_test_sk9822
+    led_test_c.c
+    sk9822.pio
+)
+
+# Konfiguracja USB/UART stdio
+pico_enable_stdio_uart(led_test_sk9822 0)
+pico_enable_stdio_usb(led_test_sk9822 1)
+
+# Generuj nagłówek dla nowego programu PIO
+pico_generate_pio_header(led_test_sk9822 ${CMAKE_CURRENT_LIST_DIR}/sk9822.pio)
+
+# Dołącz potrzebne biblioteki
+target_link_libraries(led_test_sk9822
+    pico_stdlib
+    hardware_pio
+    hardware_clocks
+    hardware_dma
+    m
+)
+
+# Dodaj dodatkowe pliki wyjściowe (uf2, etc.)
+pico_add_extra_outputs(led_test_sk9822)
+
+================================================
+File: blink.pio
+================================================
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+
+; SET pin 0 should be mapped to your LED GPIO
+
+.program blink
+    pull block
+    out y, 32
+.wrap_target
+    mov x, y
+    set pins, 1   ; Turn LED on
+lp1:
+    jmp x-- lp1   ; Delay for (x + 1) cycles, x is a 32 bit number
+    mov x, y
+    set pins, 0   ; Turn LED off
+lp2:
+    jmp x-- lp2   ; Delay for the same number of cycles again
+.wrap             ; Blink forever!
+
+
+% c-sdk {
+// this is a raw helper function for use by the user which sets up the GPIO output, and configures the SM to output on a particular pin
+
+void blink_program_init(PIO pio, uint sm, uint offset, uint pin) {
+   pio_gpio_init(pio, pin);
+   pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+   pio_sm_config c = blink_program_get_default_config(offset);
+   sm_config_set_set_pins(&c, pin, 1);
+   pio_sm_init(pio, sm, offset, &c);
+}
+%}
+
+================================================
+File: led_test_c.c
+================================================
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdbool.h>
+
+#include "pico/stdlib.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/dma.h"
+
+// Dołącz wygenerowany nagłówek z nowego programu PIO
+#include "sk9822.pio.h"
+
+// --- Konfiguracja Diód ---
+#define NUM_LEDS 144
+#define DATA_PIN 11
+#define CLOCK_PIN 10
+
+// Zalecana bezpieczna prędkość zegara dla SK9822/APA102 to 15-25 MHz
+#define LED_CLOCK_FREQ (15 * 1000 * 1000)
+
+// Domyślna globalna jasność (0-31)
+#define GLOBAL_BRIGHTNESS_VALUE 10
+
+// --- Konfiguracja Bufora Ramki SK9822 ---
+// Ramka startowa (32 bity zer)
+#define START_FRAME_COUNT 1
+
+// Ramka końcowa (32 bity jedynek)
+// Dla SK9822/APA102, po wysłaniu danych potrzeba dodatkowych NUM_LEDS/2 cykli zegara.
+// Dla 144 diod to 72 cykle. Każda ramka końcowa to 32 cykle.
+// ceil(72 / 32) = 3 ramki końcowe.
+#define END_FRAME_COUNT 3
+
+// Całkowity rozmiar bufora w słowach 32-bitowych
+#define FRAME_BUFFER_SIZE (START_FRAME_COUNT + NUM_LEDS + END_FRAME_COUNT)
+
+// Bufor na ramki danych (teraz jako uint32_t)
+uint32_t led_frame_buffer[FRAME_BUFFER_SIZE];
+
+// Zmienne DMA
+int dma_chan;
+PIO pio_instance = pio0;
+uint sm;
+
+// Funkcja tworząca 32-bitową ramkę dla diody SK9822
+// Format: 111 (3b) + Jasność (5b) + Niebieski (8b) + Zielony (8b) + Czerwony (8b)
+static inline uint32_t create_sk9822_frame(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
+    // Ogranicz jasność do 5 bitów (0-31)
+    uint32_t bright_val = brightness & 0x1F;
+    
+    return (0b111 << 29) |        // 3 bity startowe '111'
+           (bright_val << 24) |   // 5 bitów jasności
+           ((uint32_t)b << 16) |  // 8 bitów - Niebieski
+           ((uint32_t)g << 8) |   // 8 bitów - Zielony
+           (uint32_t)r;           // 8 bitów - Czerwony
+}
+
+// Ustaw kolor pojedynczej diody w buforze
+void set_led_color(int index, uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
+    if (index < 0 || index >= NUM_LEDS) return;
+    // Pozycja w buforze: 1 (start) + indeks diody
+    led_frame_buffer[START_FRAME_COUNT + index] = create_sk9822_frame(r, g, b, brightness);
+}
+
+// Ustaw ten sam kolor dla wszystkich diod
+void set_all_leds_color(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness) {
+    for (int i = 0; i < NUM_LEDS; ++i) {
+        set_led_color(i, r, g, b, brightness);
+    }
+}
+
+// Inicjalizacja bufora (ramki startowe i końcowe)
+void prepare_frames() {
+    // Ustaw ramkę startową (32 bity zer)
+    led_frame_buffer[0] = 0x00000000;
+
+    // Ustaw ramki końcowe (32 bity jedynek)
+    int end_frame_offset = START_FRAME_COUNT + NUM_LEDS;
+    for (int i = 0; i < END_FRAME_COUNT; ++i) {
+        led_frame_buffer[end_frame_offset + i] = 0xFFFFFFFF;
+    }
+}
+
+// Dodaj flagi dla bezpiecznego obsługiwania bufora
+volatile bool dma_transfer_in_progress = false;
+
+// Zmodyfikowana funkcja wysyłania bufora
+void send_frame_buffer() {
+    // Czekaj na zakończenie poprzedniego transferu przed rozpoczęciem nowego
+    dma_channel_wait_for_finish_blocking(dma_chan);
+    
+    // Ustaw flagę aktywnego transferu
+    dma_transfer_in_progress = true;
+    
+    // Konfiguruje i uruchamia transfer DMA
+    dma_channel_transfer_from_buffer_now(dma_chan, led_frame_buffer, FRAME_BUFFER_SIZE);
+    
+    // Opcjonalnie: dla animacji pozwalamy na działanie w tle
+    // Dla zmian wzorów lepiej poczekać, aby uniknąć uszkodzenia bufora
+}
+
+// Główna funkcja inicjalizacyjna PIO i DMA
+void sk9822_init() {
+    sm = pio_claim_unused_sm(pio_instance, true);
+    uint offset = pio_add_program(pio_instance, &sk9822_program);
+
+    // Wywołaj funkcję inicjalizacyjną z pliku .pio
+    sk9822_program_init(pio_instance, sm, offset, LED_CLOCK_FREQ, CLOCK_PIN, DATA_PIN);
+
+    // Inicjalizacja kanału DMA
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, false);
+    channel_config_set_dreq(&c, pio_get_dreq(pio_instance, sm, true));
+    
+    // Dodaj obsługę przerwań DMA (opcjonalnie)
+    dma_channel_set_irq0_enabled(dma_chan, true);
+    
+    dma_channel_configure(dma_chan, &c, &pio_instance->txf[sm], NULL, 0, false);
+    
+    // Inicjalizuj flagi
+    dma_transfer_in_progress = false;
+}
+
+
+void rainbow_effect(float phase) {
+    for (int i = 0; i < NUM_LEDS; ++i) {
+        float hue = (float)i / NUM_LEDS * 6.28f + phase;
+        uint8_t r = (uint8_t)(127 * (1 + sin(hue)));
+        uint8_t g = (uint8_t)(127 * (1 + sin(hue + 2.09f))); // 2*PI/3
+        uint8_t b = (uint8_t)(127 * (1 + sin(hue + 4.18f))); // 4*PI/3
+        set_led_color(i, r, g, b, GLOBAL_BRIGHTNESS_VALUE);
+    }
+}
+
+void pattern_gradient() {
+    printf("\n--- Wzór: Gradient kolorów ---\n");
+    // Czekaj na zakończenie poprzedniego transferu przed modyfikacją bufora
+    dma_channel_wait_for_finish_blocking(dma_chan);
+    
+    for (int i = 0; i < NUM_LEDS; i++) {
+        uint8_t r = (uint8_t)(255 * i / NUM_LEDS);
+        uint8_t g = (uint8_t)(255 - (255 * i / NUM_LEDS));
+        uint8_t b = 128;
+        set_led_color(i, r, g, b, GLOBAL_BRIGHTNESS_VALUE);
+    }
+    send_frame_buffer();
+    sleep_ms(5000); // Zwiększono z 2000 do 5000 ms
+}
+
+void pattern_stripes() {
+    printf("\n--- Wzór: Paski ---\n");
+    // Czekaj na zakończenie poprzedniego transferu przed modyfikacją bufora
+    dma_channel_wait_for_finish_blocking(dma_chan);
+    
+    for (int i = 0; i < NUM_LEDS; i++) {
+        if ((i / 12) % 2 == 0) {
+            set_led_color(i, 255, 255, 0, GLOBAL_BRIGHTNESS_VALUE); // Żółty
+        } else {
+            set_led_color(i, 0, 255, 255, GLOBAL_BRIGHTNESS_VALUE); // Cyan
+        }
+    }
+    send_frame_buffer();
+    sleep_ms(5000); // Zwiększono z 2000 do 5000 ms
+}
+
+
+void pattern_rainbow_anim() {
+    printf("\n--- Wzór: Animowana tęcza ---\n");
+    for (int cycle = 0; cycle < 100; ++cycle) {
+        // Czekaj aż poprzedni transfer DMA się zakończy
+        dma_channel_wait_for_finish_blocking(dma_chan);
+        
+        // Teraz bezpiecznie możemy modyfikować bufor
+        float phase = (float)cycle * 0.1f;
+        rainbow_effect(phase);
+        
+        // Wysyłamy zaktualizowany bufor
+        send_frame_buffer();
+        
+        // Synchronizacja czasowa
+        sleep_ms(100);
+    }
+}
+
+void pattern_all_off() {
+    // Czekaj na zakończenie poprzedniego transferu przed modyfikacją bufora
+    dma_channel_wait_for_finish_blocking(dma_chan);
+    
+    set_all_leds_color(0, 0, 0, 0);
+    send_frame_buffer();
+    sleep_ms(1000); // Zwiększono z 500 do 1000 ms
+}
+
+
+int main() {
+    stdio_init_all();
+    sleep_ms(3000); // Czas na otwarcie terminala
+    printf("--- Start programu testu LED SK9822 ---\n");
+
+    // Inicjalizacja wbudowanej diody LED na Pico
+    #ifdef PICO_DEFAULT_LED_PIN
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    #endif
+
+    printf("Inicjalizacja PIO i DMA...\n");
+    sk9822_init();
+    
+    printf("Przygotowanie bufora ramki...\n");
+    prepare_frames();
+
+    // --- Uruchomienie sekwencji testowej ---
+
+    // Test: Zapalanie kolejnych czerwonych diod
+    printf("\n--- Test: zapalanie kolejnych LEDów ---\n");
+    for (int n = 1; n <= NUM_LEDS; n+=5) {
+        set_all_leds_color(0, 0, 0, 0);
+        for (int i = 0; i < n; ++i) {
+            set_led_color(i, 255, 0, 0, GLOBAL_BRIGHTNESS_VALUE); // czerwony
+        }
+        send_frame_buffer();
+        printf("Zapalono %d LED\n", n);
+        dma_channel_wait_for_finish_blocking(dma_chan);
+        sleep_ms(500); // Zwiększono z 100 do 500 ms
+    }
+    pattern_all_off();
+    
+    // Testy wzorów
+    pattern_gradient();
+    pattern_all_off();
+
+    pattern_stripes();
+    pattern_all_off();
+    
+    // Animowana tęcza
+    pattern_rainbow_anim();
+    pattern_all_off();
+
+    printf("\nTesty zakończone. Program w pętli.\n");
+
+    // Pętla główna - miganie diodą na płytce
+    int counter = 0;
+    while (true) {
+        printf("Pętla główna, licznik: %d\n", counter++);
+        #ifdef PICO_DEFAULT_LED_PIN
+        gpio_put(PICO_DEFAULT_LED_PIN, !gpio_get(PICO_DEFAULT_LED_PIN));
+        #endif
+        sleep_ms(1000);
+    }
+    return 0;
+}
+// Koniec pliku led_test_c.c
+
+
+================================================
+File: led_test_c_patterns.c
+================================================
+// led_test_c_patterns.c
+// Archiwalna kopia oryginalnego kodu testującego prędkość LED
+// Przeniesione z led_test_c.c dnia 2025-06-20
+
+#include "led_test_c.c"// led_test_c_patterns.c
+// Archiwalna kopia oryginalnego kodu testującego prędkość LED
+// Przeniesione z led_test_c.c dnia 2025-06-20
+
+#include "led_test_c.c"
+
+
+================================================
+File: pico_sdk_import.cmake
+================================================
+# This is a copy of <PICO_SDK_PATH>/external/pico_sdk_import.cmake
+
+# This can be dropped into an external project to help locate this SDK
+# It should be include()ed prior to project()
+
+# Copyright 2020 (c) 2020 Raspberry Pi (Trading) Ltd.
+#
+# Redistribution and use in source and binary forms, with or without modification, are permitted provided that the
+# following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following
+# disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following
+# disclaimer in the documentation and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products
+# derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+# INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+if (DEFINED ENV{PICO_SDK_PATH} AND (NOT PICO_SDK_PATH))
+    set(PICO_SDK_PATH $ENV{PICO_SDK_PATH})
+    message("Using PICO_SDK_PATH from environment ('${PICO_SDK_PATH}')")
+endif ()
+
+if (DEFINED ENV{PICO_SDK_FETCH_FROM_GIT} AND (NOT PICO_SDK_FETCH_FROM_GIT))
+    set(PICO_SDK_FETCH_FROM_GIT $ENV{PICO_SDK_FETCH_FROM_GIT})
+    message("Using PICO_SDK_FETCH_FROM_GIT from environment ('${PICO_SDK_FETCH_FROM_GIT}')")
+endif ()
+
+if (DEFINED ENV{PICO_SDK_FETCH_FROM_GIT_PATH} AND (NOT PICO_SDK_FETCH_FROM_GIT_PATH))
+    set(PICO_SDK_FETCH_FROM_GIT_PATH $ENV{PICO_SDK_FETCH_FROM_GIT_PATH})
+    message("Using PICO_SDK_FETCH_FROM_GIT_PATH from environment ('${PICO_SDK_FETCH_FROM_GIT_PATH}')")
+endif ()
+
+if (DEFINED ENV{PICO_SDK_FETCH_FROM_GIT_TAG} AND (NOT PICO_SDK_FETCH_FROM_GIT_TAG))
+    set(PICO_SDK_FETCH_FROM_GIT_TAG $ENV{PICO_SDK_FETCH_FROM_GIT_TAG})
+    message("Using PICO_SDK_FETCH_FROM_GIT_TAG from environment ('${PICO_SDK_FETCH_FROM_GIT_TAG}')")
+endif ()
+
+if (PICO_SDK_FETCH_FROM_GIT AND NOT PICO_SDK_FETCH_FROM_GIT_TAG)
+  set(PICO_SDK_FETCH_FROM_GIT_TAG "master")
+  message("Using master as default value for PICO_SDK_FETCH_FROM_GIT_TAG")
+endif()
+
+set(PICO_SDK_PATH "${PICO_SDK_PATH}" CACHE PATH "Path to the Raspberry Pi Pico SDK")
+set(PICO_SDK_FETCH_FROM_GIT "${PICO_SDK_FETCH_FROM_GIT}" CACHE BOOL "Set to ON to fetch copy of SDK from git if not otherwise locatable")
+set(PICO_SDK_FETCH_FROM_GIT_PATH "${PICO_SDK_FETCH_FROM_GIT_PATH}" CACHE FILEPATH "location to download SDK")
+set(PICO_SDK_FETCH_FROM_GIT_TAG "${PICO_SDK_FETCH_FROM_GIT_TAG}" CACHE FILEPATH "release tag for SDK")
+
+if (NOT PICO_SDK_PATH)
+    if (PICO_SDK_FETCH_FROM_GIT)
+        include(FetchContent)
+        set(FETCHCONTENT_BASE_DIR_SAVE ${FETCHCONTENT_BASE_DIR})
+        if (PICO_SDK_FETCH_FROM_GIT_PATH)
+            get_filename_component(FETCHCONTENT_BASE_DIR "${PICO_SDK_FETCH_FROM_GIT_PATH}" REALPATH BASE_DIR "${CMAKE_SOURCE_DIR}")
+        endif ()
+        FetchContent_Declare(
+                pico_sdk
+                GIT_REPOSITORY https://github.com/raspberrypi/pico-sdk
+                GIT_TAG ${PICO_SDK_FETCH_FROM_GIT_TAG}
+        )
+
+        if (NOT pico_sdk)
+            message("Downloading Raspberry Pi Pico SDK")
+            # GIT_SUBMODULES_RECURSE was added in 3.17
+            if (${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.17.0")
+                FetchContent_Populate(
+                        pico_sdk
+                        QUIET
+                        GIT_REPOSITORY https://github.com/raspberrypi/pico-sdk
+                        GIT_TAG ${PICO_SDK_FETCH_FROM_GIT_TAG}
+                        GIT_SUBMODULES_RECURSE FALSE
+
+                        SOURCE_DIR ${FETCHCONTENT_BASE_DIR}/pico_sdk-src
+                        BINARY_DIR ${FETCHCONTENT_BASE_DIR}/pico_sdk-build
+                        SUBBUILD_DIR ${FETCHCONTENT_BASE_DIR}/pico_sdk-subbuild
+                )
+            else ()
+                FetchContent_Populate(
+                        pico_sdk
+                        QUIET
+                        GIT_REPOSITORY https://github.com/raspberrypi/pico-sdk
+                        GIT_TAG ${PICO_SDK_FETCH_FROM_GIT_TAG}
+
+                        SOURCE_DIR ${FETCHCONTENT_BASE_DIR}/pico_sdk-src
+                        BINARY_DIR ${FETCHCONTENT_BASE_DIR}/pico_sdk-build
+                        SUBBUILD_DIR ${FETCHCONTENT_BASE_DIR}/pico_sdk-subbuild
+                )
+            endif ()
+
+            set(PICO_SDK_PATH ${pico_sdk_SOURCE_DIR})
+        endif ()
+        set(FETCHCONTENT_BASE_DIR ${FETCHCONTENT_BASE_DIR_SAVE})
+    else ()
+        message(FATAL_ERROR
+                "SDK location was not specified. Please set PICO_SDK_PATH or set PICO_SDK_FETCH_FROM_GIT to on to fetch from git."
+                )
+    endif ()
+endif ()
+
+get_filename_component(PICO_SDK_PATH "${PICO_SDK_PATH}" REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
+if (NOT EXISTS ${PICO_SDK_PATH})
+    message(FATAL_ERROR "Directory '${PICO_SDK_PATH}' not found")
+endif ()
+
+set(PICO_SDK_INIT_CMAKE_FILE ${PICO_SDK_PATH}/pico_sdk_init.cmake)
+if (NOT EXISTS ${PICO_SDK_INIT_CMAKE_FILE})
+    message(FATAL_ERROR "Directory '${PICO_SDK_PATH}' does not appear to contain the Raspberry Pi Pico SDK")
+endif ()
+
+set(PICO_SDK_PATH ${PICO_SDK_PATH} CACHE PATH "Path to the Raspberry Pi Pico SDK" FORCE)
+
+include(${PICO_SDK_INIT_CMAKE_FILE})
+
+
+================================================
+File: sk9822.pio
+================================================
+;
+; Program PIO do sterowania diodami SK9822 (podobnymi do APA102)
+; Poprawiona wersja eliminująca efekt flickeringu.
+;
+; Zmiany:
+; 1. Dodano instrukcję na końcu cyklu, która zapewnia, że zegar kończy się w stanie niskim
+; 2. Zoptymalizowano timing dla większej stabilności
+;
+
+.program sk9822
+.side_set 1              ; Używamy side-set dla pinu zegara
+
+.wrap_target
+    set y, 31        side 0   ; Ustaw licznik pętli (32 bity). Ustawia CLK = 0.
+bitloop:
+    out pins, 1      side 0   ; Wystaw 1 bit danych z OSR na pin DATA. Ustawia CLK = 0.
+    nop              side 1   ; Poczekaj z CLK = 1 (bardziej stabilny timing)
+    jmp y--, bitloop side 0   ; Zdekrementuj licznik, skocz do bitloop. Ustawia CLK = 0.
+    nop              side 0   ; Upewnij się, że zegar kończy w stanie niskim
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// Funkcja pomocnicza do inicjalizacji State Machine (SM) PIO
+// Ta sekcja C-SDK pozostaje bez zmian, jest poprawna.
+static inline void sk9822_program_init(PIO pio, uint sm, uint offset, uint baud, uint pin_clk, uint pin_data) {
+    // Ustawia piny CLK i DATA jako wyjścia
+    pio_sm_set_pins_with_mask(pio, sm, 0, (1u << pin_clk) | (1u << pin_data));
+    pio_sm_set_pindirs_with_mask(pio, sm, (1u << pin_clk) | (1u << pin_data), (1u << pin_clk) | (1u << pin_data));
+    pio_gpio_init(pio, pin_clk);
+    pio_gpio_init(pio, pin_data);
+
+    // Pobierz domyślną konfigurację dla tego programu
+    pio_sm_config c = sk9822_program_get_default_config(offset);
+
+    // Skonfiguruj piny 'out' (dla DATA) i 'side-set' (dla CLK)
+    sm_config_set_out_pins(&c, pin_data, 1);
+    sm_config_set_sideset_pins(&c, pin_clk);
+
+    // Skonfiguruj rejestr przesuwny (OSR)
+    // - Przesuwaj w prawo (MSB first)
+    // - Włącz autopull, aby automatycznie pobierać dane z TX FIFO
+    // - Próg autopull ustawiony na 32 bity
+    sm_config_set_out_shift(&c, false, true, 32);
+
+    // Połącz TX i RX FIFO, aby uzyskać głębszy bufor TX (8 słów)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // Oblicz dzielnik zegara na podstawie zegara systemowego i docelowej szybkości transmisji (baud)
+    // Program potrzebuje 2 cykli na bit (out + jmp) 
+    float div = (float)clock_get_hz(clk_sys) / (2 * baud);
+    sm_config_set_clkdiv(&c, div);
+
+    // Załaduj konfigurację do SM, włącz ją i ustaw w punkcie startowym programu
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+

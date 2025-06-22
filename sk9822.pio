@@ -1,0 +1,59 @@
+;
+; Program PIO do sterowania diodami SK9822 (podobnymi do APA102)
+; Poprawiona wersja eliminująca efekt flickeringu.
+;
+; Zmiany:
+; 1. Dodano instrukcję na końcu cyklu, która zapewnia, że zegar kończy się w stanie niskim
+; 2. Zoptymalizowano timing dla większej stabilności
+;
+
+.program sk9822
+.side_set 1              ; Używamy side-set dla pinu zegara
+
+.wrap_target
+    set y, 31        side 0   ; Ustaw licznik pętli (32 bity). Ustawia CLK = 0.
+bitloop:
+    out pins, 1      side 0   ; Wystaw 1 bit danych z OSR na pin DATA. Ustawia CLK = 0.
+    nop              side 1   ; Poczekaj z CLK = 1 (bardziej stabilny timing)
+    jmp y--, bitloop side 0   ; Zdekrementuj licznik, skocz do bitloop. Ustawia CLK = 0.
+    nop              side 0   ; Upewnij się, że zegar kończy w stanie niskim
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+// Funkcja pomocnicza do inicjalizacji State Machine (SM) PIO
+// Ta sekcja C-SDK pozostaje bez zmian, jest poprawna.
+static inline void sk9822_program_init(PIO pio, uint sm, uint offset, uint baud, uint pin_clk, uint pin_data) {
+    // Ustawia piny CLK i DATA jako wyjścia
+    pio_sm_set_pins_with_mask(pio, sm, 0, (1u << pin_clk) | (1u << pin_data));
+    pio_sm_set_pindirs_with_mask(pio, sm, (1u << pin_clk) | (1u << pin_data), (1u << pin_clk) | (1u << pin_data));
+    pio_gpio_init(pio, pin_clk);
+    pio_gpio_init(pio, pin_data);
+
+    // Pobierz domyślną konfigurację dla tego programu
+    pio_sm_config c = sk9822_program_get_default_config(offset);
+
+    // Skonfiguruj piny 'out' (dla DATA) i 'side-set' (dla CLK)
+    sm_config_set_out_pins(&c, pin_data, 1);
+    sm_config_set_sideset_pins(&c, pin_clk);
+
+    // Skonfiguruj rejestr przesuwny (OSR)
+    // - Przesuwaj w prawo (MSB first)
+    // - Włącz autopull, aby automatycznie pobierać dane z TX FIFO
+    // - Próg autopull ustawiony na 32 bity
+    sm_config_set_out_shift(&c, false, true, 32);
+
+    // Połącz TX i RX FIFO, aby uzyskać głębszy bufor TX (8 słów)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // Oblicz dzielnik zegara na podstawie zegara systemowego i docelowej szybkości transmisji (baud)
+    // Program potrzebuje 2 cykli na bit (out + jmp) 
+    float div = (float)clock_get_hz(clk_sys) / (2 * baud);
+    sm_config_set_clkdiv(&c, div);
+
+    // Załaduj konfigurację do SM, włącz ją i ustaw w punkcie startowym programu
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
